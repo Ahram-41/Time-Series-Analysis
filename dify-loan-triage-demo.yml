@@ -1,0 +1,332 @@
+# Dify workflow YAML for the W4 hands-on demo.
+# Flow: router -> cleaner -> extractor (+repair) -> analyst -> drafter -> human gate.
+kind: workflow
+version: 0.1.0
+metadata:
+  name: loan-triage-w4-demo
+  description: Minimal, auditable triage chain for the W4 workshop.
+  author: workshop
+  tags: [w04, demo, workflow]
+  defaults:
+    llm_provider: openai
+    fast_model: gpt-4o-mini
+    main_model: gpt-4o
+
+inputs:
+  email_text:
+    type: string
+    required: true
+    label: Raw email body pasted from the inbox
+  attachments:
+    type: array
+    required: false
+    label: Attachment names or URLs (optional)
+
+variables:
+  policy_dti_limit: 0.45
+  draft_tone: concise, polite, banker-to-customer
+  risk_rules: >
+    - Escalate if credit_score < 620 or requested_amount > 1000000.
+    - If intent != loan_application, keep amounts null and escalate=true.
+
+workflow:
+  nodes:
+    - id: start
+      type: start
+      description: Entry point; passes inputs to the router.
+
+    - id: router_llm
+      type: llm
+      name: Router (intent)
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.fast_model }}"
+        mode: chat
+        temperature: 0.1
+      prompt: |
+        You are the Router for MUFG loan triage.
+        Classify the incoming text into one of: "loan_application", "support", "spam".
+        Return JSON only:
+        {
+          "intent": "loan_application|support|spam",
+          "reason": "short justification"
+        }
+        Text:
+        {{ inputs.email_text }}
+
+    - id: router_parse
+      type: code
+      name: Parse router JSON
+      language: python3
+      inputs:
+        router_raw: "{{ router_llm.outputs.text }}"
+      code: |
+        import json
+
+        def run(inputs):
+            result = {"intent": "loan_application", "reason": "", "ok": True, "error": ""}
+            try:
+                data = json.loads(inputs["router_raw"])
+                result["intent"] = data.get("intent", "loan_application")
+                result["reason"] = data.get("reason", "")
+            except Exception as err:
+                result["ok"] = False
+                result["error"] = f"Router returned invalid JSON: {err}"
+            return result
+
+    - id: route_branch
+      type: condition
+      name: Route spam/support/loan
+      expression: "{{ router_parse.outputs.intent }}"
+      cases:
+        - when: "spam"
+          next: drop
+        - when: "support"
+          next: drafter_support
+        - default: cleaner_llm
+
+    - id: drop
+      type: end
+      name: Drop spam
+      description: Stop the flow for spam/junk intents.
+
+    - id: cleaner_llm
+      type: llm
+      name: Cleaner
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.fast_model }}"
+        mode: chat
+        temperature: 0.2
+      prompt: |
+        Clean the email for downstream parsing.
+        - Keep original meaning and numbers.
+        - Remove signatures, disclaimers, tracking noise.
+        - Keep PII already present; do not invent new PII.
+        Output only the cleaned text.
+        Original:
+        {{ inputs.email_text }}
+
+    - id: extractor_llm
+      type: llm
+      name: Extractor (JSON)
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.main_model }}"
+        mode: chat
+        temperature: 0.1
+      prompt: |
+        You are the Extractor for loan triage. Return strict JSON in this shape:
+        {
+          "customer_name": "...",
+          "intent": "loan_application" | "support" | "other",
+          "requested_amount": number | null,
+          "income": number | null,
+          "credit_score": number | null,
+          "documents": ["..."],
+          "escalate": true | false
+        }
+        Rules:
+        - Use null for unknown numbers; do not invent values.
+        - If intent != loan_application, set escalate=true and keep numbers null.
+        - Keep any PII already present; do not add new PII.
+        Clean text:
+        {{ cleaner_llm.outputs.text }}
+
+    - id: validate_extract
+      type: code
+      name: Validate extractor JSON
+      language: python3
+      inputs:
+        raw_json: "{{ extractor_llm.outputs.text }}"
+      code: |
+        import json
+
+        def run(inputs):
+            result = {"ok": True, "error": "", "data": None}
+            try:
+                data = json.loads(inputs["raw_json"])
+                required = [
+                    "customer_name",
+                    "intent",
+                    "requested_amount",
+                    "income",
+                    "credit_score",
+                    "documents",
+                    "escalate",
+                ]
+                missing = [k for k in required if k not in data]
+                if missing:
+                    raise ValueError(f"missing keys: {', '.join(missing)}")
+                result["data"] = data
+            except Exception as err:
+                result["ok"] = False
+                result["error"] = f"Invalid extractor output: {err}"
+            return result
+
+    - id: extractor_repair
+      type: llm
+      name: Repair extractor JSON
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.main_model }}"
+        mode: chat
+        temperature: 0
+      prompt: |
+        The previous extractor output was invalid JSON.
+        Error: {{ validate_extract.outputs.error }}
+        Regenerate valid JSON using the same schema.
+        Clean text:
+        {{ cleaner_llm.outputs.text }}
+
+    - id: validate_repair
+      type: code
+      name: Validate repaired JSON
+      language: python3
+      inputs:
+        raw_json: "{{ extractor_repair.outputs.text }}"
+      code: |
+        import json
+
+        def run(inputs):
+            result = {"ok": True, "error": "", "data": None}
+            try:
+                data = json.loads(inputs["raw_json"])
+                result["data"] = data
+            except Exception as err:
+                result["ok"] = False
+                result["error"] = f"Repair still invalid: {err}"
+            return result
+
+    - id: analyst_llm
+      type: llm
+      name: Analyst (risk/flags)
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.main_model }}"
+        mode: chat
+        temperature: 0.2
+      prompt: |
+        You are the Analyst. Evaluate the structured extraction and set:
+        - risk_flag: low | medium | high
+        - rationale: one or two sentences
+        - escalate: true if any policy/risk concern
+        Use rules:
+        {{ variables.risk_rules }}
+
+        Extraction (first attempt):
+        {{ validate_extract.outputs.data }}
+        Extraction (after repair, if any):
+        {{ validate_repair.outputs.data }}
+        Validation errors (if any):
+        {{ validate_extract.outputs.error }} {{ validate_repair.outputs.error }}
+        Return JSON:
+        {"risk_flag":"low|medium|high","rationale":"...","escalate":true|false}
+
+    - id: drafter_support
+      type: llm
+      name: Drafter (support path)
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.main_model }}"
+        mode: chat
+        temperature: 0.3
+      prompt: |
+        Draft a short, polite reply for a support request.
+        Goal: acknowledge, route to support queue, and avoid product promises.
+        Mention that a banker will follow up.
+        Email:
+        {{ inputs.email_text }}
+
+    - id: drafter_llm
+      type: llm
+      name: Drafter (loan path)
+      model:
+        provider: "{{ metadata.defaults.llm_provider }}"
+        name: "{{ metadata.defaults.main_model }}"
+        mode: chat
+        temperature: 0.3
+      prompt: |
+        You are the Drafter writing to a customer about their loan inquiry.
+        Use the structured extraction and analyst notes. Keep tone:
+        {{ variables.draft_tone }}
+        Include:
+        - Acknowledge the request and amount.
+        - If escalate=true, say a banker will review before proceeding.
+        - If data is missing, ask for the specific fields.
+        Structured data (first pass):
+        {{ validate_extract.outputs.data }}
+        Structured data (repaired, if present):
+        {{ validate_repair.outputs.data }}
+        Analyst output:
+        {{ analyst_llm.outputs.text }}
+        Respond with a customer-ready draft email (no JSON).
+
+    - id: human_gate
+      type: approval
+      name: Human Gate
+      description: Banker reviews JSON + rationale + draft before sending/logging.
+      inputs:
+        extraction_first: "{{ validate_extract.outputs.data }}"
+        extraction_repair: "{{ validate_repair.outputs.data }}"
+        analyst: "{{ analyst_llm.outputs.text }}"
+        draft: "{{ drafter_llm.outputs.text }}"
+        support_draft: "{{ drafter_support.outputs.text }}"
+      instructions: >
+        Verify numbers, tone, and escalate flag. Edit the draft if needed before approval.
+
+    - id: end
+      type: end
+      name: Finish
+
+  edges:
+    - source: start
+      target: router_llm
+    - source: router_llm
+      target: router_parse
+    - source: router_parse
+      target: route_branch
+    - source: route_branch
+      target: drop
+      when: "{{ router_parse.outputs.intent == 'spam' }}"
+    - source: route_branch
+      target: drafter_support
+      when: "{{ router_parse.outputs.intent == 'support' }}"
+    - source: route_branch
+      target: cleaner_llm
+      when: "{{ router_parse.outputs.intent == 'loan_application' }}"
+    - source: cleaner_llm
+      target: extractor_llm
+    - source: extractor_llm
+      target: validate_extract
+    - source: validate_extract
+      target: analyst_llm
+      when: "{{ validate_extract.outputs.ok == true }}"
+    - source: validate_extract
+      target: extractor_repair
+      when: "{{ validate_extract.outputs.ok != true }}"
+    - source: extractor_repair
+      target: validate_repair
+    - source: validate_repair
+      target: analyst_llm
+    - source: analyst_llm
+      target: drafter_llm
+      when: "{{ router_parse.outputs.intent == 'loan_application' }}"
+    - source: analyst_llm
+      target: human_gate
+      when: "{{ router_parse.outputs.intent == 'loan_application' }}"
+    - source: drafter_support
+      target: human_gate
+    - source: drafter_llm
+      target: human_gate
+    - source: human_gate
+      target: end
+
+outputs:
+  intent: "{{ router_parse.outputs.intent }}"
+  extraction_first: "{{ validate_extract.outputs.data }}"
+  extraction_repair: "{{ validate_repair.outputs.data }}"
+  analyst: "{{ analyst_llm.outputs.text }}"
+  banker_draft: "{{ drafter_llm.outputs.text }}"
+  support_draft: "{{ drafter_support.outputs.text }}"
+  approved_text: "{{ human_gate.outputs.text }}"
